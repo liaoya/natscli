@@ -14,11 +14,12 @@
 package main
 
 import (
-	iu "github.com/nats-io/natscli/internal/util"
 	"log"
 	"os"
 	"runtime"
 	"runtime/debug"
+
+	iu "github.com/nats-io/natscli/internal/util"
 
 	"github.com/choria-io/fisk"
 	"github.com/nats-io/natscli/plugins"
@@ -58,6 +59,7 @@ See 'nats cheat' for a quick cheatsheet of commands`
 	ncli.Flag("tlskey", "TLS private key").Envar("NATS_KEY").PlaceHolder("FILE").ExistingFileVar(&opts.TlsKey)
 	ncli.Flag("tlsca", "TLS certificate authority chain").Envar("NATS_CA").PlaceHolder("FILE").ExistingFileVar(&opts.TlsCA)
 	ncli.Flag("tlsfirst", "Perform TLS handshake before expecting the server greeting").BoolVar(&opts.TlsFirst)
+	ncli.Flag("tlsinsecure", "Disable TLS Certificate Verification").BoolVar(&opts.TlsInsecure)
 	if runtime.GOOS == "windows" {
 		ncli.Flag("certstore", "Uses a Windows Certificate Store for TLS (user, machine)").PlaceHolder("TYPE").EnumVar(&opts.WinCertStoreType, "user", "windowscurrentuser", "machine", "windowslocalmachine")
 		ncli.Flag("certstore-match", "Which certificate to use in the store").PlaceHolder("QUERY").StringVar(&opts.WinCertStoreMatch)

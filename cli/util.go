@@ -17,11 +17,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/jedib0t/go-pretty/v6/progress"
 	"io"
 	"math"
 	"math/rand"
@@ -36,6 +36,8 @@ import (
 	"text/template"
 	"time"
 	"unicode"
+
+	"github.com/jedib0t/go-pretty/v6/progress"
 
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/natscli/options"
@@ -277,6 +279,10 @@ func natsOpts() []nats.Option {
 	connectionName := strings.TrimSpace(opts().ConnectionName)
 	if len(connectionName) == 0 {
 		connectionName = "NATS CLI Version " + Version
+	}
+
+	if opts().TlsInsecure {
+		copts = append(copts, nats.Secure(&tls.Config{InsecureSkipVerify: true}))
 	}
 
 	return append(copts, []nats.Option{
