@@ -14,43 +14,73 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+
 	"github.com/choria-io/fisk"
-	"github.com/nats-io/natscli/internal/archive"
-	audit2 "github.com/nats-io/natscli/internal/audit"
+	"github.com/fatih/color"
+	"github.com/nats-io/jsm.go/audit"
+	"github.com/nats-io/jsm.go/audit/archive"
+	iu "github.com/nats-io/natscli/internal/util"
 )
 
 type auditAnalyzeCmd struct {
 	archivePath   string
 	examplesLimit uint
+	collection    *audit.CheckCollection
+	block         []string
+	json          bool
+	writePath     string
+	loadPath      string
+	force         bool
 	verbose       bool
-	quiet         bool
-	checks        []audit2.Check
+	isTerminal    bool
 }
 
-func configureAuditAnalyzeCommand(srv *fisk.CmdClause) {
+func configureAuditAnalyzeCommand(app *fisk.CmdClause) {
 	c := &auditAnalyzeCmd{
-		checks: audit2.GetDefaultChecks(),
+		isTerminal: iu.IsTerminal(),
 	}
 
-	analyze := srv.Command("analyze", "perform checks against an archive created by the 'gather' subcommand").Action(c.analyze)
-	analyze.Arg("archive", "path to input archive to analyze").Required().ExistingFileVar(&c.archivePath)
+	analyze := app.Command("analyze", "perform checks against an archive created by the 'gather' subcommand").Action(c.analyze)
+	analyze.Arg("archive", "path to input archive to analyze").ExistingFileVar(&c.archivePath)
 	analyze.Flag("max-examples", "How many example issues to display for each failed check (0 for unlimited)").Default("5").UintVar(&c.examplesLimit)
-	analyze.Flag("quiet", "Disable info and warning messages during analysis").BoolVar(&c.quiet)
-	// Hidden flags
-	analyze.Flag("verbose", "Enable debug console messages during analysis").Hidden().BoolVar(&c.verbose)
+	analyze.Flag("skip", "Prevents checks from running by check code").PlaceHolder("CODE").StringsVar(&c.block)
+	analyze.Flag("load", "Loads a saved report").PlaceHolder("FILE").StringVar(&c.loadPath)
+	analyze.Flag("save", "Stores the analyze result to a file").PlaceHolder("FILE").StringVar(&c.writePath)
+	analyze.Flag("force", "Force overwriting existing report files").Short('f').UnNegatableBoolVar(&c.force)
+	analyze.Flag("json", "Output JSON format").Short('j').BoolVar(&c.json)
+	analyze.Flag("verbose", "Log verbosely").UnNegatableBoolVar(&c.verbose)
 }
 
-func (cmd *auditAnalyzeCmd) analyze(_ *fisk.ParseContext) error {
-	// Adjust log levels
-	if cmd.quiet {
-		audit2.LogQuiet()
-	} else if cmd.verbose {
-		audit2.LogVerbose()
+func (c *auditAnalyzeCmd) analyze(_ *fisk.ParseContext) error {
+	switch {
+	case opts().Trace:
+		audit.LogVerbose()
+	case !c.verbose:
+		audit.LogQuiet()
 	}
 
-	// Open archive
-	ar, err := archive.NewReader(cmd.archivePath)
+	var err error
+	c.collection, err = audit.NewDefaultCheckCollection()
+	if err != nil {
+		return err
+	}
+
+	if c.loadPath != "" {
+		return c.loadAndRender()
+	}
+
+	if c.writePath != "" && iu.FileExists(c.writePath) && !c.force {
+		return fmt.Errorf("result file %q already exist, use --force to overwrite", c.writePath)
+	}
+
+	if c.archivePath == "" {
+		return fmt.Errorf("archive path is required")
+	}
+
+	ar, err := archive.NewReader(c.archivePath)
 	if err != nil {
 		return fmt.Errorf("failed to open archive: %w", err)
 	}
@@ -61,26 +91,78 @@ func (cmd *auditAnalyzeCmd) analyze(_ *fisk.ParseContext) error {
 		}
 	}()
 
-	// Table that groups checks based on their outcome
-	summaryTable := make(map[audit2.Outcome][]audit2.Check)
-	for _, outcome := range audit2.Outcomes {
-		summaryTable[outcome] = make([]audit2.Check, 0)
+	report := c.collection.Run(ar, c.examplesLimit, c.block)
+	err = c.renderReport(report)
+	if err != nil {
+		return err
 	}
 
-	// Run all checks
-	fmt.Printf("Running %d checks against archive: %s\n", len(cmd.checks), cmd.archivePath)
-	for _, check := range cmd.checks {
-		outcome, examples := audit2.RunCheck(check, ar, cmd.examplesLimit)
-		fmt.Printf("[%s] %s (%s)\n%s\n", outcome, check.Name, check.Description, examples)
+	if c.writePath != "" {
+		j, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			return err
+		}
 
-		summaryTable[outcome] = append(summaryTable[outcome], check)
+		return os.WriteFile(c.writePath, j, 0644)
 	}
 
-	// Print summary of checks
-	fmt.Printf("\nSummary of checks:\n")
-	for outcome, checks := range summaryTable {
-		fmt.Printf("%s: %d\n", outcome, len(checks))
+	return nil
+}
+
+func (c *auditAnalyzeCmd) loadAndRender() error {
+	report, err := audit.LoadAnalysis(c.loadPath)
+	if err != nil {
+		return err
 	}
+
+	return c.renderReport(report)
+}
+
+func (c *auditAnalyzeCmd) outcomeWithColor(o audit.Outcome) string {
+	if !c.isTerminal {
+		return o.String()
+	}
+
+	switch o {
+	case audit.Pass:
+		return color.GreenString(o.String())
+	case audit.PassWithIssues:
+		return color.YellowString(o.String())
+	case audit.Skipped:
+		return o.String()
+	case audit.Fail:
+		return color.RedString(o.String())
+	default:
+		return o.String()
+	}
+}
+
+func (c *auditAnalyzeCmd) renderReport(report *audit.Analysis) error {
+	if c.json {
+		return iu.PrintJSON(report)
+	}
+
+	fmt.Printf("NATS Audit Report %q captured at %s\n\n", c.archivePath, f(report.Metadata.Timestamp))
+
+	for _, res := range report.Results {
+		fmt.Printf("[%s] [%s] %s\n", c.outcomeWithColor(res.Outcome), res.Check.Code, res.Check.Description)
+		if res.Examples.Error != "" {
+			fmt.Printf("%s: %s\n", color.RedString("Error"), res.Examples.Error)
+		}
+		if res.Examples.Count() > 0 {
+			res.Examples.Limit = c.examplesLimit
+			fmt.Println(res.Examples.String())
+		}
+	}
+
+	cols := newColumns("Report Summary")
+	cols.AddSectionTitle("Archive Connection Information")
+	cols.AddRow("Connection Server", report.Metadata.ConnectURL)
+	cols.AddRow("Server Version", report.Metadata.ConnectedServerVersion)
+	cols.AddRow("User", report.Metadata.UserName)
+	cols.AddSectionTitle("Summary of Checks")
+	cols.AddMapInts(report.Outcomes, true, false)
+	cols.Frender(os.Stdout)
 
 	return nil
 }

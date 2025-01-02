@@ -787,10 +787,6 @@ func renderCluster(cluster *api.ClusterInfo) string {
 	return f(compact)
 }
 
-// doReqAsyncWaitFullTimeoutInterval special value to be passed as `waitFor` argument of doReqAsync to turn off
-// "adaptive" timeout and wait for the full interval
-const doReqAsyncWaitFullTimeoutInterval = -1
-
 // doReqAsync serializes and sends a request to the given subject and handles multiple responses.
 // This function uses the value from `Timeout` CLI flag as upper limit for responses gathering.
 // The value of the `waitFor` may shorten the interval during which responses are gathered:
