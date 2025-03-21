@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -122,7 +122,7 @@ func (c *pubCmd) prepareMsg(subj string, body []byte, seq int) (*nats.Msg, error
 	msg.Reply = c.replyTo
 	msg.Data = body
 
-	return msg, parseStringsToMsgHeader(c.hdrs, seq, msg)
+	return msg, iu.ParseStringsToMsgHeader(c.hdrs, seq, msg)
 }
 
 func (c *pubCmd) doReq(nc *nats.Conn, progress *progress.Tracker) error {
@@ -133,12 +133,12 @@ func (c *pubCmd) doReq(nc *nats.Conn, progress *progress.Tracker) error {
 			log.Printf("Sending request on %q\n", c.subject)
 		}
 
-		body, err := pubReplyBodyTemplate(c.body, "", i)
+		body, err := iu.PubReplyBodyTemplate(c.body, "", i)
 		if err != nil {
 			log.Printf("Could not parse body template: %s", err)
 		}
 
-		subj, err := pubReplyBodyTemplate(c.subject, "", i)
+		subj, err := iu.PubReplyBodyTemplate(c.subject, "", i)
 		if err != nil {
 			log.Printf("Could not parse subject template: %s", err)
 		}
@@ -242,12 +242,12 @@ func (c *pubCmd) doReq(nc *nats.Conn, progress *progress.Tracker) error {
 func (c *pubCmd) doJetstream(nc *nats.Conn, progress *progress.Tracker) error {
 	for i := 1; i <= c.cnt; i++ {
 		start := time.Now()
-		body, err := pubReplyBodyTemplate(c.body, "", i)
+		body, err := iu.PubReplyBodyTemplate(c.body, "", i)
 		if err != nil {
 			log.Printf("Could not parse body template: %s", err)
 		}
 
-		subj, err := pubReplyBodyTemplate(c.subject, "", i)
+		subj, err := iu.PubReplyBodyTemplate(c.subject, "", i)
 		if err != nil {
 			log.Printf("Could not parse subject template: %s", err)
 		}
@@ -258,6 +258,8 @@ func (c *pubCmd) doJetstream(nc *nats.Conn, progress *progress.Tracker) error {
 		}
 
 		msg.Subject = string(subj)
+
+		log.Printf("Published %d bytes to %q\n", len(body), c.subject)
 
 		resp, err := nc.RequestMsg(msg, opts().Timeout)
 		if err != nil {
@@ -276,14 +278,14 @@ func (c *pubCmd) doJetstream(nc *nats.Conn, progress *progress.Tracker) error {
 		if progress != nil {
 			progress.Increment(1)
 		} else {
-			fmt.Printf(">>> Stream: %s Sequence: %s", ack.Stream, f(ack.Sequence))
+			msg := fmt.Sprintf("Stored in Stream: %s Sequence: %s", ack.Stream, f(ack.Sequence))
 			if ack.Domain != "" {
-				fmt.Printf(" Domain: %q", ack.Domain)
+				msg += fmt.Sprintf(" Domain: %q", ack.Domain)
 			}
 			if ack.Duplicate {
-				fmt.Printf(" Duplicate: true")
+				msg += " Duplicate: true"
 			}
-			fmt.Println()
+			log.Printf(msg)
 		}
 
 		// If applicable, account for the wait duration in a publish sleep.
@@ -344,12 +346,12 @@ func (c *pubCmd) publish(_ *fisk.ParseContext) error {
 	}
 
 	for i := 1; i <= c.cnt; i++ {
-		body, err := pubReplyBodyTemplate(c.body, "", i)
+		body, err := iu.PubReplyBodyTemplate(c.body, "", i)
 		if err != nil {
 			log.Printf("Could not parse body template: %s", err)
 		}
 
-		subj, err := pubReplyBodyTemplate(c.subject, "", i)
+		subj, err := iu.PubReplyBodyTemplate(c.subject, "", i)
 		if err != nil {
 			log.Printf("Could not parse subject template: %s", err)
 		}

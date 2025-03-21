@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -125,6 +125,7 @@ type streamCmd struct {
 	metadata               map[string]string
 	metadataIsSet          bool
 	compression            string
+	compressionSet         bool
 	firstSeq               uint64
 	limitInactiveThreshold time.Duration
 	limitMaxAckPending     int
@@ -152,12 +153,16 @@ type streamCmd struct {
 	vwTranslate  string
 	vwSubject    string
 
-	dryRun             bool
-	selectedStream     *jsm.Stream
-	nc                 *nats.Conn
-	mgr                *jsm.Manager
-	chunkSize          string
-	placementPreferred string
+	dryRun                    bool
+	selectedStream            *jsm.Stream
+	nc                        *nats.Conn
+	mgr                       *jsm.Manager
+	chunkSize                 string
+	placementPreferred        string
+	allowMsgTTlSet            bool
+	allowMsgTTL               bool
+	subjectDeleteMarkerTTLSet bool
+	subjectDeleteMarkerTTL    time.Duration
 }
 
 type streamStat struct {
@@ -185,7 +190,7 @@ func configureStreamCommand(app commandHost) {
 		if !edit {
 			f.Flag("storage", "Storage backend to use (file, memory)").EnumVar(&c.storage, "file", "f", "memory", "m")
 		}
-		f.Flag("compression", "Compression algorithm to use (file storage only)").Default("none").EnumVar(&c.compression, "none", "s2")
+		f.Flag("compression", "Compression algorithm to use (file storage only)").IsSetByUser(&c.compressionSet).EnumVar(&c.compression, "none", "s2")
 		f.Flag("replicas", "When clustered, how many replicas of the data to create").Int64Var(&c.replicas)
 		f.Flag("tag", "Place the stream on servers that has specific tags (pass multiple times)").IsSetByUser(&c.placementTagsSet).StringsVar(&c.placementTags)
 		f.Flag("tags", "Backward compatibility only, use --tag").Hidden().IsSetByUser(&c.placementTagsSet).StringsVar(&c.placementTags)
@@ -213,6 +218,10 @@ func configureStreamCommand(app commandHost) {
 		f.Flag("deny-purge", "Deny entire stream or subject purges via the API").IsSetByUser(&c.denyPurgeSet).BoolVar(&c.denyPurge)
 		f.Flag("allow-direct", "Allows fast, direct, access to stream data via the direct get API").IsSetByUser(&c.allowDirectSet).Default("true").BoolVar(&c.allowDirect)
 		f.Flag("allow-mirror-direct", "Allows fast, direct, access to stream data via the direct get API on mirrors").IsSetByUser(&c.allowMirrorDirectSet).BoolVar(&c.allowMirrorDirect)
+		if !edit {
+			f.Flag("allow-msg-ttl", "Allows per-message TTL handling").IsSetByUser(&c.allowMsgTTlSet).UnNegatableBoolVar(&c.allowMsgTTL)
+		}
+		f.Flag("subject-del-markers-ttl", "How long delete markers should persist in the Stream").PlaceHolder("DURATION").IsSetByUser(&c.subjectDeleteMarkerTTLSet).DurationVar(&c.subjectDeleteMarkerTTL)
 		f.Flag("transform-source", "Stream subject transform source").PlaceHolder("SOURCE").StringVar(&c.subjectTransformSource)
 		f.Flag("transform-destination", "Stream subject transform destination").PlaceHolder("DEST").StringVar(&c.subjectTransformDest)
 		f.Flag("metadata", "Adds metadata to the stream").PlaceHolder("META").IsSetByUser(&c.metadataIsSet).StringMapVar(&c.metadata)
@@ -431,6 +440,28 @@ Finding streams with certain subjects configured:
 
 func init() {
 	registerCommand("stream", 16, configureStreamCommand)
+}
+
+func (c *streamCmd) kvAbstractionWarn(stream string, prompt string) error {
+	fmt.Println("WARNING: Operating on the underlying stream of a Key-Value bucket is dangerous.")
+	fmt.Println()
+	fmt.Println("Key-Value stores are an abstraction above JetStream Streams and as such require particular")
+	fmt.Println("configuration to be set. Interacting with KV buckets outside of the 'nats kv' subcommand can lead")
+	fmt.Println("unexpected outcomes, data loss and, technically, will mean your KV bucket is no longer a KV bucket.")
+	fmt.Println()
+	fmt.Println("Continuing this operation is an unsupported action.")
+	fmt.Println()
+
+	ans, err := askConfirmation(prompt, false)
+	if err != nil {
+		return err
+	}
+
+	if !ans {
+		return fmt.Errorf("aborting Key-Value store operation")
+	}
+
+	return nil
 }
 
 func (c *streamCmd) graphAction(_ *fisk.ParseContext) error {
@@ -756,14 +787,14 @@ func (c *streamCmd) subjectsAction(_ *fisk.ParseContext) (err error) {
 
 func (c *streamCmd) parseLimitStrings(_ *fisk.ParseContext) (err error) {
 	if c.maxBytesLimitString != "" {
-		c.maxBytesLimit, err = parseStringAsBytes(c.maxBytesLimitString)
+		c.maxBytesLimit, err = iu.ParseStringAsBytes(c.maxBytesLimitString)
 		if err != nil {
 			return err
 		}
 	}
 
 	if c.maxMsgSizeString != "" {
-		c.maxMsgSize, err = parseStringAsBytes(c.maxMsgSizeString)
+		c.maxMsgSize, err = iu.ParseStringAsBytes(c.maxMsgSizeString)
 		if err != nil {
 			return err
 		}
@@ -910,7 +941,7 @@ func (c *streamCmd) balanceAction(_ *fisk.ParseContext) error {
 
 		balanced, err := balancer.BalanceStreams(found)
 		if err != nil {
-			return fmt.Errorf("failed to balance streams - %s", err)
+			return fmt.Errorf("failed to balance streams: %s", err)
 		}
 		fmt.Printf("Balanced %d streams.\n", balanced)
 
@@ -1398,7 +1429,7 @@ func (c *streamCmd) backupAction(_ *fisk.ParseContext) error {
 
 	chunkSize := int64(128 * 1024)
 	if c.chunkSize != "" {
-		chunkSize, err = parseStringAsBytes(c.chunkSize)
+		chunkSize, err = iu.ParseStringAsBytes(c.chunkSize)
 		if err != nil {
 			return err
 		}
@@ -1734,7 +1765,7 @@ func (c *streamCmd) copyAndEditStream(cfg api.StreamConfig, pc *fisk.ParseContex
 	}
 
 	if len(c.subjects) > 0 {
-		cfg.Subjects = splitCLISubjects(c.subjects)
+		cfg.Subjects = iu.SplitCLISubjects(c.subjects)
 	}
 
 	if c.storage != "" {
@@ -1835,7 +1866,11 @@ func (c *streamCmd) copyAndEditStream(cfg api.StreamConfig, pc *fisk.ParseContex
 	}
 
 	if c.allowMirrorDirectSet {
-		cfg.MirrorDirect = c.allowMirrorDirectSet
+		cfg.MirrorDirect = c.allowMirrorDirect
+	}
+
+	if c.allowMsgTTL {
+		cfg.AllowMsgTTL = c.allowMsgTTL
 	}
 
 	if c.discardPerSubjSet {
@@ -1846,8 +1881,10 @@ func (c *streamCmd) copyAndEditStream(cfg api.StreamConfig, pc *fisk.ParseContex
 		cfg.Metadata = c.metadata
 	}
 
-	if err = cfg.Compression.UnmarshalJSON([]byte(fmt.Sprintf("%q", c.compression))); err != nil {
-		return cfg, fmt.Errorf("invalid compression algorithm")
+	if c.compressionSet {
+		if err = cfg.Compression.UnmarshalJSON([]byte(fmt.Sprintf("%q", c.compression))); err != nil {
+			return cfg, fmt.Errorf("invalid compression algorithm")
+		}
 	}
 
 	if !c.noRepub && c.repubSource != "" && c.repubDest != "" {
@@ -1873,6 +1910,10 @@ func (c *streamCmd) copyAndEditStream(cfg api.StreamConfig, pc *fisk.ParseContex
 		if subjectTransformConfig.Source != "" && subjectTransformConfig.Destination != "" {
 			cfg.SubjectTransform = &subjectTransformConfig
 		}
+	}
+
+	if c.subjectDeleteMarkerTTLSet {
+		cfg.SubjectDeleteMarkerTTL = c.subjectDeleteMarkerTTL
 	}
 
 	return cfg, nil
@@ -1973,6 +2014,13 @@ func (c *streamCmd) editAction(pc *fisk.ParseContext) error {
 		os.Exit(1)
 	}
 
+	if jsm.IsKVBucketStream(c.stream) {
+		err := c.kvAbstractionWarn(c.stream, "Really operate on the KV stream?")
+		if err != nil {
+			return err
+		}
+	}
+
 	if !c.force {
 		ok, err := askConfirmation(fmt.Sprintf("Really edit Stream %s", c.stream), false)
 		fisk.FatalIfError(err, "could not obtain confirmation")
@@ -2068,7 +2116,6 @@ func (c *streamCmd) showStreamConfig(cols *columns.Writer, cfg api.StreamConfig)
 	cols.AddRow("Retention", cfg.Retention.String())
 	cols.AddRow("Acknowledgments", !cfg.NoAck)
 	dnp := cfg.Discard.String()
-
 	if cfg.DiscardNewPer {
 		dnp = "New Per Subject"
 	}
@@ -2078,10 +2125,13 @@ func (c *streamCmd) showStreamConfig(cols *columns.Writer, cfg api.StreamConfig)
 	cols.AddRowIf("Mirror Direct Get", cfg.MirrorDirect, cfg.MirrorDirect)
 	cols.AddRow("Allows Msg Delete", !cfg.DenyDelete)
 	cols.AddRow("Allows Purge", !cfg.DenyPurge)
+	cols.AddRow("Allows Per-Message TTL", cfg.AllowMsgTTL)
+	if cfg.AllowMsgTTL && cfg.SubjectDeleteMarkerTTL > 0 {
+		cols.AddRow("Subject Delete Markers TTL", cfg.SubjectDeleteMarkerTTL)
+	}
 	cols.AddRow("Allows Rollups", cfg.RollupAllowed)
 
 	cols.AddSectionTitle("Limits")
-
 	if cfg.MaxMsgs == -1 {
 		cols.AddRow("Maximum Messages", "unlimited")
 	} else {
@@ -2482,10 +2532,10 @@ func (c *streamCmd) prepareConfig(_ *fisk.ParseContext, requireSize bool) api.St
 			}, &subjects, survey.WithValidator(survey.Required))
 			fisk.FatalIfError(err, "invalid input")
 
-			c.subjects = splitString(subjects)
+			c.subjects = iu.SplitString(subjects)
 		}
 
-		c.subjects = splitCLISubjects(c.subjects)
+		c.subjects = iu.SplitCLISubjects(c.subjects)
 	}
 
 	if c.mirror != "" && len(c.subjects) > 0 {
@@ -2677,29 +2727,31 @@ func (c *streamCmd) prepareConfig(_ *fisk.ParseContext, requireSize bool) api.St
 	}
 
 	cfg := api.StreamConfig{
-		Name:          c.stream,
-		Description:   c.description,
-		Subjects:      c.subjects,
-		MaxMsgs:       c.maxMsgLimit,
-		MaxMsgsPer:    c.maxMsgPerSubjectLimit,
-		MaxBytes:      c.maxBytesLimit,
-		MaxMsgSize:    int32(c.maxMsgSize),
-		Duplicates:    dupeWindow,
-		MaxAge:        maxAge,
-		Storage:       storage,
-		Compression:   compression,
-		FirstSeq:      c.firstSeq,
-		NoAck:         !c.ack,
-		Retention:     c.retentionPolicyFromString(),
-		Discard:       c.discardPolicyFromString(),
-		MaxConsumers:  c.maxConsumers,
-		Replicas:      int(c.replicas),
-		RollupAllowed: c.allowRollup,
-		DenyPurge:     c.denyPurge,
-		DenyDelete:    c.denyDelete,
-		AllowDirect:   c.allowDirect,
-		MirrorDirect:  c.allowMirrorDirectSet,
-		DiscardNewPer: c.discardPerSubj,
+		Name:                   c.stream,
+		Description:            c.description,
+		Subjects:               c.subjects,
+		MaxMsgs:                c.maxMsgLimit,
+		MaxMsgsPer:             c.maxMsgPerSubjectLimit,
+		MaxBytes:               c.maxBytesLimit,
+		MaxMsgSize:             int32(c.maxMsgSize),
+		Duplicates:             dupeWindow,
+		MaxAge:                 maxAge,
+		Storage:                storage,
+		Compression:            compression,
+		FirstSeq:               c.firstSeq,
+		NoAck:                  !c.ack,
+		Retention:              c.retentionPolicyFromString(),
+		Discard:                c.discardPolicyFromString(),
+		MaxConsumers:           c.maxConsumers,
+		Replicas:               int(c.replicas),
+		RollupAllowed:          c.allowRollup,
+		DenyPurge:              c.denyPurge,
+		DenyDelete:             c.denyDelete,
+		AllowDirect:            c.allowDirect,
+		AllowMsgTTL:            c.allowMsgTTL,
+		SubjectDeleteMarkerTTL: c.subjectDeleteMarkerTTL,
+		MirrorDirect:           c.allowMirrorDirectSet,
+		DiscardNewPer:          c.discardPerSubj,
 	}
 
 	if c.limitInactiveThreshold > 0 {
@@ -2722,7 +2774,7 @@ func (c *streamCmd) prepareConfig(_ *fisk.ParseContext, requireSize bool) api.St
 	}
 
 	if c.mirror != "" {
-		if isJsonString(c.mirror) {
+		if iu.IsJsonObjectString(c.mirror) {
 			cfg.Mirror, err = c.parseStreamSource(c.mirror)
 			fisk.FatalIfError(err, "invalid mirror")
 		} else {
@@ -2733,7 +2785,7 @@ func (c *streamCmd) prepareConfig(_ *fisk.ParseContext, requireSize bool) api.St
 	}
 
 	for _, source := range c.sources {
-		if isJsonString(source) {
+		if iu.IsJsonObjectString(source) {
 			ss, err := c.parseStreamSource(source)
 			fisk.FatalIfError(err, "invalid source")
 			cfg.Sources = append(cfg.Sources, ss)
@@ -2976,7 +3028,7 @@ func (c *streamCmd) askSource(name string, prefix string) *api.StreamSource {
 func (c *streamCmd) parseStreamSource(source string) (*api.StreamSource, error) {
 	ss := &api.StreamSource{}
 
-	if isJsonString(source) {
+	if iu.IsJsonObjectString(source) {
 		err := json.Unmarshal([]byte(source), ss)
 		if err != nil {
 			return nil, err
@@ -3106,6 +3158,13 @@ func (c *streamCmd) purgeAction(_ *fisk.ParseContext) (err error) {
 
 		if !ok {
 			return nil
+		}
+	}
+
+	if jsm.IsKVBucketStream(c.stream) {
+		err := c.kvAbstractionWarn(c.stream, "Really operate on the KV stream?")
+		if err != nil {
+			return err
 		}
 	}
 
@@ -3291,6 +3350,13 @@ func (c *streamCmd) rmMsgAction(_ *fisk.ParseContext) (err error) {
 	stream, err := c.loadStream(c.stream)
 	fisk.FatalIfError(err, "could not load Stream %s", c.stream)
 
+	if jsm.IsKVBucketStream(c.stream) {
+		err := c.kvAbstractionWarn(c.stream, "Really operate on the KV stream?")
+		if err != nil {
+			return err
+		}
+	}
+
 	if !c.force {
 		ok, err := askConfirmation(fmt.Sprintf("Really remove message %d from Stream %s", c.msgID, c.stream), false)
 		fisk.FatalIfError(err, "could not obtain confirmation")
@@ -3300,7 +3366,7 @@ func (c *streamCmd) rmMsgAction(_ *fisk.ParseContext) (err error) {
 		}
 	}
 
-	return stream.DeleteMessage(uint64(c.msgID))
+	return stream.DeleteMessageRequest(api.JSApiMsgDeleteRequest{Seq: uint64(c.msgID)})
 }
 
 func (c *streamCmd) getAction(_ *fisk.ParseContext) (err error) {
@@ -3345,11 +3411,11 @@ func (c *streamCmd) getAction(_ *fisk.ParseContext) (err error) {
 		return nil
 	}
 
-	fmt.Printf("Item: %s#%d received %v on Subject %s\n\n", c.stream, item.Sequence, item.Time, item.Subject)
+	fmt.Printf("Item: %s#%d received %v (%s) on Subject %s\n\n", c.stream, item.Sequence, item.Time, f(time.Since(item.Time)), item.Subject)
 
 	if len(item.Header) > 0 {
 		fmt.Println("Headers:")
-		hdrs, err := decodeHeadersMsg(item.Header)
+		hdrs, err := iu.DecodeHeadersMsg(item.Header)
 		if err == nil {
 			for k, vals := range hdrs {
 				for _, val := range vals {

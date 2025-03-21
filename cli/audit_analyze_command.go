@@ -1,4 +1,4 @@
-// Copyright 2024 The NATS Authors
+// Copyright 2024-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,6 +20,7 @@ import (
 
 	"github.com/choria-io/fisk"
 	"github.com/fatih/color"
+	"github.com/nats-io/jsm.go/api"
 	"github.com/nats-io/jsm.go/audit"
 	"github.com/nats-io/jsm.go/audit/archive"
 	iu "github.com/nats-io/natscli/internal/util"
@@ -31,6 +32,7 @@ type auditAnalyzeCmd struct {
 	collection    *audit.CheckCollection
 	block         []string
 	json          bool
+	md            bool
 	writePath     string
 	loadPath      string
 	force         bool
@@ -50,19 +52,24 @@ func configureAuditAnalyzeCommand(app *fisk.CmdClause) {
 	analyze.Flag("load", "Loads a saved report").PlaceHolder("FILE").StringVar(&c.loadPath)
 	analyze.Flag("save", "Stores the analyze result to a file").PlaceHolder("FILE").StringVar(&c.writePath)
 	analyze.Flag("force", "Force overwriting existing report files").Short('f').UnNegatableBoolVar(&c.force)
-	analyze.Flag("json", "Output JSON format").Short('j').BoolVar(&c.json)
+	analyze.Flag("json", "Output JSON format").Short('j').UnNegatableBoolVar(&c.json)
+	analyze.Flag("markdown", "Output Markdown format").UnNegatableBoolVar(&c.md)
 	analyze.Flag("verbose", "Log verbosely").UnNegatableBoolVar(&c.verbose)
 }
 
 func (c *auditAnalyzeCmd) analyze(_ *fisk.ParseContext) error {
+	var log api.Logger
+	var err error
+
 	switch {
 	case opts().Trace:
-		audit.LogVerbose()
+		log = api.NewDefaultLogger(api.TraceLevel)
 	case !c.verbose:
-		audit.LogQuiet()
+		log = api.NewDiscardLogger()
+	default:
+		log = api.NewDefaultLogger(api.InfoLevel)
 	}
 
-	var err error
 	c.collection, err = audit.NewDefaultCheckCollection()
 	if err != nil {
 		return err
@@ -91,7 +98,9 @@ func (c *auditAnalyzeCmd) analyze(_ *fisk.ParseContext) error {
 		}
 	}()
 
-	report := c.collection.Run(ar, c.examplesLimit, c.block)
+	c.collection.SkipChecks(c.block...)
+
+	report := c.collection.Run(ar, c.examplesLimit, log)
 	err = c.renderReport(report)
 	if err != nil {
 		return err
@@ -137,12 +146,44 @@ func (c *auditAnalyzeCmd) outcomeWithColor(o audit.Outcome) string {
 	}
 }
 
-func (c *auditAnalyzeCmd) renderReport(report *audit.Analysis) error {
-	if c.json {
-		return iu.PrintJSON(report)
+func (c *auditAnalyzeCmd) renderMarkdown(report *audit.Analysis) error {
+	out, err := report.ToMarkdown(audit.MarkdownFormatTemplate, c.examplesLimit)
+	if err != nil {
+		return err
 	}
 
-	fmt.Printf("NATS Audit Report %q captured at %s\n\n", c.archivePath, f(report.Metadata.Timestamp))
+	fmt.Println(string(out))
+
+	return nil
+}
+
+func (c *auditAnalyzeCmd) renderReport(report *audit.Analysis) error {
+	switch {
+	case c.json:
+		return c.renderJSON(report)
+	case c.md:
+		return c.renderMarkdown(report)
+	default:
+		return c.renderConsole(report)
+	}
+}
+
+func (c *auditAnalyzeCmd) renderJSON(report *audit.Analysis) error {
+	j, err := report.ToJSON()
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(j))
+
+	return nil
+}
+
+func (c *auditAnalyzeCmd) renderConsole(report *audit.Analysis) error {
+	if c.archivePath != "" {
+		fmt.Printf("NATS Audit Report %q captured at %s\n\n", c.archivePath, f(report.Metadata.Timestamp))
+	} else {
+		fmt.Printf("NATS Audit Report %q captured at %s\n\n", c.loadPath, f(report.Metadata.Timestamp))
+	}
 
 	for _, res := range report.Results {
 		fmt.Printf("[%s] [%s] %s\n", c.outcomeWithColor(res.Outcome), res.Check.Code, res.Check.Description)
@@ -154,6 +195,8 @@ func (c *auditAnalyzeCmd) renderReport(report *audit.Analysis) error {
 			fmt.Println(res.Examples.String())
 		}
 	}
+
+	fmt.Println()
 
 	cols := newColumns("Report Summary")
 	cols.AddSectionTitle("Archive Connection Information")

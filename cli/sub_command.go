@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -321,7 +321,7 @@ func (c *subCmd) subscribe(p *fisk.ParseContext) error {
 		subjMu         = sync.Mutex{}
 		dump           = c.dump != ""
 		ctr            = uint(0)
-		ignoreSubjects = splitCLISubjects(c.ignoreSubjects)
+		ignoreSubjects = iu.SplitCLISubjects(c.ignoreSubjects)
 		ctx, cancel    = context.WithCancel(ctx)
 
 		replySub *nats.Subscription
@@ -557,6 +557,14 @@ func (c *subCmd) subscribe(p *fisk.ParseContext) error {
 				bindDurable = true
 				c.jsAck = con.Config.AckPolicy != nats.AckNonePolicy
 				log.Printf("Subscribing to JetStream Stream %q using existing durable %q", c.stream, c.durable)
+				switch {
+				case len(con.Config.FilterSubjects) > 1:
+					return fmt.Errorf("cannot subscribe to multi filter consumers")
+				case len(con.Config.FilterSubjects) == 1:
+					c.subjects = con.Config.FilterSubjects
+				case con.Config.FilterSubject != "":
+					c.subjects = []string{con.Config.FilterSubject}
+				}
 			} else if errors.Is(err, nats.ErrConsumerNotFound) {
 				opts = append(opts, nats.Durable(c.durable))
 			} else {
@@ -608,7 +616,7 @@ func (c *subCmd) subscribe(p *fisk.ParseContext) error {
 		}
 
 		if bindDurable {
-			sub, err := js.Subscribe("", handler, nats.Bind(c.stream, c.durable))
+			sub, err := js.Subscribe(c.firstSubject(), handler, nats.Bind(c.stream, c.durable))
 			if err != nil {
 				return err
 			}
@@ -711,7 +719,7 @@ func (c *subCmd) printMsg(msg *nats.Msg, reply *nats.Msg, ctr uint, startTime ti
 		}
 
 	} else {
-		// Output format 4: pretty
+		// Output format 3: pretty
 
 		if info == nil {
 			if msg.Reply != "" {
@@ -720,7 +728,7 @@ func (c *subCmd) printMsg(msg *nats.Msg, reply *nats.Msg, ctr uint, startTime ti
 				fmt.Printf("[#%d]%s Received on %q\n", ctr, timeStamp, msg.Subject)
 			}
 		} else if c.jetStream {
-			fmt.Printf("[#%d] Received JetStream message: stream: %s seq %d / subject: %s / time: %v\n", ctr, info.Stream(), info.StreamSequence(), msg.Subject, info.TimeStamp().Format(time.RFC3339))
+			fmt.Printf("[#%d] Received JetStream message: stream: %s seq %d / subject: %s / time: %v\n", ctr, info.Stream(), info.StreamSequence(), msg.Subject, info.TimeStamp().UTC().Format(time.RFC3339))
 		} else {
 			fmt.Printf("[#%d] Received JetStream message: consumer: %s > %s / subject: %s / delivered: %d / consumer seq: %d / stream seq: %d\n", ctr, info.Stream(), info.Consumer(), msg.Subject, info.Delivered(), info.ConsumerSequence(), info.StreamSequence())
 		}
@@ -752,6 +760,15 @@ func (c *subCmd) dumpMsg(msg *nats.Msg, stdout bool, filepath string, ctr uint) 
 	serMsg.Header = msg.Header
 	serMsg.Data = msg.Data
 	serMsg.Reply = msg.Reply
+
+	if c.translate != "" {
+		data, err := filterDataThroughCmd(msg.Data, c.translate, "", "")
+		if err != nil {
+			log.Printf("%q\nError while translating msg body: %s\n\n", data, err.Error())
+			return
+		}
+		serMsg.Data = data
+	}
 
 	jm, err := json.Marshal(serMsg)
 	if err != nil {
