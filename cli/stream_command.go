@@ -218,9 +218,7 @@ func configureStreamCommand(app commandHost) {
 		f.Flag("deny-purge", "Deny entire stream or subject purges via the API").IsSetByUser(&c.denyPurgeSet).BoolVar(&c.denyPurge)
 		f.Flag("allow-direct", "Allows fast, direct, access to stream data via the direct get API").IsSetByUser(&c.allowDirectSet).Default("true").BoolVar(&c.allowDirect)
 		f.Flag("allow-mirror-direct", "Allows fast, direct, access to stream data via the direct get API on mirrors").IsSetByUser(&c.allowMirrorDirectSet).BoolVar(&c.allowMirrorDirect)
-		if !edit {
-			f.Flag("allow-msg-ttl", "Allows per-message TTL handling").IsSetByUser(&c.allowMsgTTlSet).UnNegatableBoolVar(&c.allowMsgTTL)
-		}
+		f.Flag("allow-msg-ttl", "Allows per-message TTL handling").IsSetByUser(&c.allowMsgTTlSet).UnNegatableBoolVar(&c.allowMsgTTL)
 		f.Flag("subject-del-markers-ttl", "How long delete markers should persist in the Stream").PlaceHolder("DURATION").IsSetByUser(&c.subjectDeleteMarkerTTLSet).DurationVar(&c.subjectDeleteMarkerTTL)
 		f.Flag("transform-source", "Stream subject transform source").PlaceHolder("SOURCE").StringVar(&c.subjectTransformSource)
 		f.Flag("transform-destination", "Stream subject transform destination").PlaceHolder("DEST").StringVar(&c.subjectTransformDest)
@@ -368,7 +366,7 @@ Finding streams with certain subjects configured:
 
 	strView := str.Command("view", "View messages in a stream").Action(c.viewAction)
 	strView.Arg("stream", "Stream name").StringVar(&c.stream)
-	strView.Arg("size", "Page size").Default("10").IntVar(&c.vwPageSize)
+	strView.Arg("size", "Page size <= 25").Default("10").IntVar(&c.vwPageSize)
 	strView.Flag("id", "Start at a specific message Sequence").IntVar(&c.vwStartId)
 	strView.Flag("since", "Delivers messages received since a duration like 1d3h5m2s").DurationVar(&c.vwStartDelta)
 	strView.Flag("raw", "Show the raw data received").UnNegatableBoolVar(&c.vwRaw)
@@ -1077,6 +1075,7 @@ func (c *streamCmd) viewAction(_ *fisk.ParseContext) error {
 	}
 
 	if c.vwPageSize > 25 {
+		log.Printf("Page size is limited to 25, setting to 25...")
 		c.vwPageSize = 25
 	}
 

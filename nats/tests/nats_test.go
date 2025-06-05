@@ -17,15 +17,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/nats-io/natscli/cli"
 	"math/rand"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kballard/go-shellquote"
+
+	"github.com/nats-io/natscli/cli"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/nats-io/jsm.go"
@@ -58,23 +63,29 @@ func runNatsCli(t *testing.T, args ...string) (output []byte) {
 
 func runNatsCliWithInput(t *testing.T, input string, args ...string) (output []byte) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
+	var runArgs []string
 	var cmd string
+	var err error
 	if os.Getenv("CI") == "true" {
-		cmd = fmt.Sprintf("./nats %s", strings.Join(args, " "))
+		cmd = "../nats"
+		runArgs, err = shellquote.Split(strings.Join(args, " "))
 	} else {
-		cmd = fmt.Sprintf("go run $(ls *.go | grep -v _test.go) %s", strings.Join(args, " "))
+		cmd = "go"
+		runArgs, err = shellquote.Split(fmt.Sprintf("run ../main.go %s", strings.Join(args, " ")))
+	}
+	if err != nil {
+		t.Fatalf("spliting command argument string failed: %v", err)
 	}
 
-	execution := exec.CommandContext(ctx, "bash", "-c", cmd)
-	if input != "" {
-		execution.Stdin = strings.NewReader(input)
+	if _, err := exec.LookPath(cmd); err != nil {
+		t.Fatalf("could not find %s in path", cmd)
+		return
 	}
-	out, err := execution.CombinedOutput()
+
+	out, err := runCommand(cmd, input, runArgs...)
 	if err != nil {
-		t.Fatalf("nats utility failed: %v\n%v", err, string(out))
+		t.Fatalf("%v", err)
 	}
 
 	return out
@@ -99,12 +110,26 @@ func setupJStreamTest(t *testing.T) (srv *server.Server, nc *nats.Conn, mgr *jsm
 
 	dir, err := os.MkdirTemp("", "")
 	checkErr(t, err, "could not create temporary js store: %v", err)
+	sysAcc := server.NewAccount("SYS")
 
 	srv, err = server.NewServer(&server.Options{
-		Port:      -1,
-		StoreDir:  dir,
-		JetStream: true,
+		Port:          -1,
+		ServerName:    "TEST_SERVER",
+		StoreDir:      dir,
+		JetStream:     true,
+		SystemAccount: "SYS",
+		Accounts: []*server.Account{
+			sysAcc,
+		},
+		Users: []*server.User{
+			{
+				Username: "sys",
+				Password: "pass",
+				Account:  sysAcc,
+			},
+		},
 	})
+
 	checkErr(t, err, "could not start js server: %v", err)
 
 	go srv.Start()
@@ -122,6 +147,110 @@ func setupJStreamTest(t *testing.T) (srv *server.Server, nc *nats.Conn, mgr *jsm
 	}
 
 	return srv, nc, mgr
+}
+func withJSCluster(t *testing.T, cb func(*testing.T, []*server.Server, *nats.Conn, *jsm.Manager) error) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping on Windows due to GitHub Actions resource constraints")
+	}
+
+	d, err := os.MkdirTemp("", "jstest")
+	if err != nil {
+		t.Fatalf("temp dir could not be made: %s", err)
+	}
+	defer os.RemoveAll(d)
+
+	var (
+		servers []*server.Server
+	)
+
+	sysAcc := server.NewAccount("SYS")
+
+	for i := 1; i <= 3; i++ {
+		opts := &server.Options{
+			JetStream:  true,
+			StoreDir:   filepath.Join(d, fmt.Sprintf("s%d", i)),
+			Port:       -1,
+			Host:       "localhost",
+			ServerName: fmt.Sprintf("s%d", i),
+			LogFile:    filepath.Join(d, fmt.Sprintf("s%d.log", i)),
+			Cluster: server.ClusterOpts{
+				Name: "TEST",
+				Port: 12000 + i,
+			},
+			Routes: []*url.URL{
+				{Host: "localhost:12001"},
+				{Host: "localhost:12002"},
+				{Host: "localhost:12003"},
+			},
+			SystemAccount: "SYS",
+			Accounts: []*server.Account{
+				sysAcc,
+			},
+			Users: []*server.User{
+				{
+					Username: "sys",
+					Password: "pass",
+					Account:  sysAcc,
+				},
+			},
+		}
+
+		s, err := server.NewServer(opts)
+		if err != nil {
+			t.Fatalf("server %d start failed: %v", i, err)
+		}
+		s.ConfigureLogger()
+		go s.Start()
+		if !s.ReadyForConnections(10 * time.Second) {
+			t.Errorf("nats server %d did not start", i)
+		}
+		defer func() {
+			s.Shutdown()
+		}()
+
+		servers = append(servers, s)
+	}
+
+	if len(servers) != 3 {
+		t.Fatalf("servers did not start")
+	}
+
+	nc, err := nats.Connect(servers[0].ClientURL(), nats.UseOldRequestStyle())
+	if err != nil {
+		t.Fatalf("client start failed: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc, jsm.WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("manager creation failed: %s", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			_, err := mgr.JetStreamAccountInfo()
+			if err != nil {
+				continue
+			}
+
+			err = cb(t, servers, nc, mgr)
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			return
+		case <-ctx.Done():
+			t.Fatalf("jetstream did not become available")
+		}
+	}
 }
 
 func setupConsTest(t *testing.T) (srv *server.Server, nc *nats.Conn, mgr *jsm.Manager) {
@@ -471,13 +600,13 @@ func TestCLIStreamBackupAndRestore(t *testing.T) {
 	checkErr(t, err, "temp dir failed")
 	os.RemoveAll(td)
 
-	runNatsCli(t, fmt.Sprintf("--server='%s' str backup file1 %s --no-progress", srv.ClientURL(), td))
+	runNatsCli(t, fmt.Sprintf("--server='%s' str backup file1 '%s' --no-progress", srv.ClientURL(), td))
 
 	preState, err := stream.State()
 	checkErr(t, err, "state failed")
 	stream.Delete()
 
-	runNatsCli(t, fmt.Sprintf("--server='%s' str restore  %s --no-progress", srv.ClientURL(), td))
+	runNatsCli(t, fmt.Sprintf("--server='%s' str restore  '%s' --no-progress", srv.ClientURL(), td))
 	stream, err = mgr.NewStreamFromDefault("file1", file1Stream())
 	checkErr(t, err, "could not create stream: %v", err)
 
@@ -807,13 +936,13 @@ func TestCLIStreamBackupRestore(t *testing.T) {
 		checkErr(t, err, "publish failed")
 	}
 
-	runNatsCli(t, fmt.Sprintf("--server='%s' stream backup file1 %s", srv.ClientURL(), target))
+	runNatsCli(t, fmt.Sprintf("--server='%s' stream backup file1 '%s'", srv.ClientURL(), target))
 
 	err = stream.Delete()
 	checkErr(t, err, "delete failed")
 	streamShouldNotExist(t, mgr, "file1")
 
-	runNatsCli(t, fmt.Sprintf("--server='%s' stream restore %s", srv.ClientURL(), target))
+	runNatsCli(t, fmt.Sprintf("--server='%s' stream restore '%s'", srv.ClientURL(), target))
 	streamShouldExist(t, mgr, "file1")
 
 	stream, err = mgr.LoadStream("file1")

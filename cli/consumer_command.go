@@ -1555,11 +1555,7 @@ func (c *consumerCmd) prepareConfig() (cfg *api.ConsumerConfig, err error) {
 		}
 
 		if cfg.Durable != "" && c.consumer != "" && cfg.Durable != c.consumer {
-			if c.consumer != "" {
-				cfg.Durable = c.consumer
-			} else {
-				return cfg, fmt.Errorf("durable consumer name in %s does not match CLI consumer name %s", c.inputFile, c.consumer)
-			}
+			cfg.Durable = c.consumer
 		}
 
 		if cfg.DeliverSubject != "" && c.delivery != "" {
@@ -2056,6 +2052,7 @@ func (c *consumerCmd) validateCfg(cfg *api.ConsumerConfig) (bool, []byte, []stri
 }
 
 func (c *consumerCmd) createAction(pc *fisk.ParseContext) (err error) {
+	c.connectAndSetup(true, false)
 	cfg, err := c.prepareConfig()
 	if err != nil {
 		return err
@@ -2085,8 +2082,6 @@ func (c *consumerCmd) createAction(pc *fisk.ParseContext) (err error) {
 
 		return os.WriteFile(c.outFile, j, 0600)
 	}
-
-	c.connectAndSetup(true, false)
 
 	err = c.checkConfigLevel(cfg)
 	if err != nil {

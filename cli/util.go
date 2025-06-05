@@ -288,7 +288,9 @@ func natsOpts() []nats.Option {
 func jetstreamOpts() []jetstream.JetStreamOpt {
 	opts := opts()
 
-	res := []jetstream.JetStreamOpt{}
+	res := []jetstream.JetStreamOpt{
+		jetstream.WithDefaultTimeout(opts.Timeout),
+	}
 
 	if opts.Trace {
 		ct := &jetstream.ClientTrace{
@@ -375,7 +377,6 @@ func prepareJSHelper() (*nats.Conn, jetstream.JetStream, error) {
 	var err error
 	opts := options.DefaultOptions
 
-	jsOpts()
 	if opts.Conn == nil {
 		opts.Conn, _, err = prepareHelperUnlocked("", natsOpts()...)
 		if err != nil {
@@ -506,6 +507,10 @@ func loadContext(softFail bool) error {
 
 	if opts.TlsFirst {
 		ctxOpts = append(ctxOpts, natscontext.WithTLSHandshakeFirst())
+	}
+
+	if opts.Token != "" {
+		ctxOpts = append(ctxOpts, natscontext.WithToken(opts.Token))
 	}
 
 	if opts.Username != "" && opts.Password == "" {
